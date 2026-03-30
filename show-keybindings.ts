@@ -138,6 +138,8 @@ class KeybindingsViewer implements Component {
 	private headerLine = "";
 	private footerLine = "";
 	private readonly termRows: number;
+	private query = "";
+	private lastQuery = "";
 
 	constructor(
 		tui: TUI,
@@ -195,13 +197,22 @@ class KeybindingsViewer implements Component {
 		const userBindings = this.keybindings.getUserBindings();
 		const resolved = this.keybindings.getResolvedBindings();
 
+		const filterLower = this.query.toLowerCase();
+
 		// Header
 		const titleText = " Keybindings ";
-		const hint = " ↑↓/PgUp/PgDn scroll  q/Esc close  * = overridden ";
-		const hintWidth = Math.max(0, innerW - visibleWidth(titleText) - visibleWidth(hint));
+		const queryDisplay = this.query
+			? " filter: " + th.fg("warning", this.query) + " "
+			: "";
+		const hint = this.query
+			? " Bksp delete  Ctrl+G clear  Esc close "
+			: " ↑↓/PgUp/PgDn scroll  type to filter  Esc close  * = overridden ";
+		const queryVisWidth = this.query ? visibleWidth(" filter: " + this.query + " ") : 0;
+		const hintWidth = Math.max(0, innerW - visibleWidth(titleText) - queryVisWidth - visibleWidth(hint));
 		this.headerLine =
 			th.fg("border", "╭") +
 			th.fg("accent", titleText) +
+			queryDisplay +
 			th.fg("border", "─".repeat(hintWidth)) +
 			th.fg("dim", hint) +
 			th.fg("border", "╮");
@@ -212,15 +223,8 @@ class KeybindingsViewer implements Component {
 		const body: string[] = [];
 
 		for (const section of SECTIONS) {
-			// Section separator line
-			const secLabel = ` ${section.title} `;
-			const secDashes = "─".repeat(Math.max(0, innerW - visibleWidth(secLabel) - 1));
-			body.push(
-				th.fg("border", "│") +
-					th.fg("accent", secLabel) +
-					th.fg("border", secDashes + " ") +
-					th.fg("border", "│"),
-			);
+			// Collect matching rows for this section
+			const sectionRows: string[] = [];
 
 			for (const id of section.ids) {
 				const rawKeys = resolved[id];
@@ -234,17 +238,64 @@ class KeybindingsViewer implements Component {
 					// Unknown id — leave blank
 				}
 
+				// Filter: match query against description, id, or keys
+				if (filterLower) {
+					const haystack = (description + " " + id + " " + keysArr.join(" ")).toLowerCase();
+					if (!haystack.includes(filterLower)) continue;
+				}
+
 				const row = this.buildRow(id, keysArr, description, isModified, descColW);
-				body.push(`${th.fg("border", "│")} ${row} ${th.fg("border", "│")}`);
+				sectionRows.push(`${th.fg("border", "│")} ${row} ${th.fg("border", "│")}`);
 			}
+
+			// Only show section header if it has matching rows
+			if (sectionRows.length > 0) {
+				const secLabel = ` ${section.title} `;
+				const secDashes = "─".repeat(Math.max(0, innerW - visibleWidth(secLabel) - 1));
+				body.push(
+					th.fg("border", "│") +
+						th.fg("accent", secLabel) +
+						th.fg("border", secDashes + " ") +
+						th.fg("border", "│"),
+				);
+				body.push(...sectionRows);
+			}
+		}
+
+		if (body.length === 0 && filterLower) {
+			const noMatch = th.fg("muted", "No matching keybindings");
+			const pad = " ".repeat(Math.max(0, innerW - visibleWidth("No matching keybindings")));
+			body.push(`${th.fg("border", "│")}${noMatch}${pad}${th.fg("border", "│")}`);
 		}
 
 		this.bodyLines = body;
 	}
 
 	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || data === "q" || data === "Q") {
-			this.done();
+		if (matchesKey(data, "escape")) {
+			if (this.query) {
+				this.query = "";
+				this.scrollOffset = 0;
+				this.lastWidth = 0; // force rebuild
+			} else {
+				this.done();
+			}
+			return;
+		}
+
+		if (matchesKey(data, "ctrl+g")) {
+			this.query = "";
+			this.scrollOffset = 0;
+			this.lastWidth = 0; // force rebuild
+			return;
+		}
+
+		if (matchesKey(data, "backspace")) {
+			if (this.query.length > 0) {
+				this.query = this.query.slice(0, -1);
+				this.scrollOffset = 0;
+				this.lastWidth = 0; // force rebuild
+			}
 			return;
 		}
 
@@ -262,12 +313,18 @@ class KeybindingsViewer implements Component {
 			this.scrollOffset = 0;
 		} else if (matchesKey(data, "end")) {
 			this.scrollOffset = maxScroll;
+		} else if (data.length === 1 && data >= " " && data <= "~") {
+			// Printable ASCII character — append to filter query
+			this.query += data;
+			this.scrollOffset = 0;
+			this.lastWidth = 0; // force rebuild
 		}
 	}
 
 	render(width: number): string[] {
-		if (width !== this.lastWidth) {
+		if (width !== this.lastWidth || this.query !== this.lastQuery) {
 			this.lastWidth = width;
+			this.lastQuery = this.query;
 			this.buildContent(width);
 			// Clamp scroll after rebuild
 			const maxScroll = Math.max(0, this.bodyLines.length - this.viewportHeight);
@@ -293,31 +350,41 @@ class KeybindingsViewer implements Component {
 }
 
 export default function (pi: ExtensionAPI) {
+	async function showKeybindings(ctx: { hasUI: boolean; ui: any }) {
+		if (!ctx.hasUI) {
+			ctx.ui.notify("The keybindings viewer requires interactive mode", "error");
+			return;
+		}
+
+		let termRows = 24;
+
+		await ctx.ui.custom<void>(
+			(tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (v: void) => void) => {
+				termRows = tui.terminal.rows;
+				return new KeybindingsViewer(tui, theme, keybindings, () => done(undefined));
+			},
+			{
+				overlay: true,
+				overlayOptions: () => ({
+					width: "90%",
+					maxHeight: Math.floor(termRows * 0.85),
+					anchor: "center",
+				}),
+			},
+		);
+	}
+
+	pi.registerShortcut("ctrl+h", {
+		description: "Show keybindings",
+		handler: async (ctx) => {
+			await showKeybindings(ctx);
+		},
+	});
+
 	pi.registerCommand("keybindings", {
 		description: "Show all current keybindings in a scrollable overlay",
 		handler: async (_args, ctx) => {
-			if (!ctx.hasUI) {
-				ctx.ui.notify("The keybindings viewer requires interactive mode", "error");
-				return;
-			}
-
-			// Capture termRows from TUI inside the factory so overlayOptions can use it
-			let termRows = 24;
-
-			await ctx.ui.custom<void>(
-				(tui, theme, keybindings, done) => {
-					termRows = tui.terminal.rows;
-					return new KeybindingsViewer(tui, theme, keybindings, () => done(undefined));
-				},
-				{
-					overlay: true,
-					overlayOptions: () => ({
-						width: "90%",
-						maxHeight: Math.floor(termRows * 0.85),
-						anchor: "center",
-					}),
-				},
-			);
+			await showKeybindings(ctx);
 		},
 	});
 }
